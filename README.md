@@ -9,6 +9,21 @@ Note: This handler cannot perform replacements on compressed content. If your re
 
 This module supports the use of placeholders in the `search` and `replace` arguments (but not regexes).
 
+In buffered mode, successful GET responses selected for replacement receive a
+weak `ETag` computed from the transformed body. Requests with a matching
+`If-None-Match` receive `304 Not Modified`; changes to the output, including
+placeholder values, change the tag. The file must still be read and transformed
+to calculate the tag, so revalidation saves response bandwidth rather than
+server-side processing. Weak tags remain valid across downstream compression.
+
+Original `ETag` and `Last-Modified` headers are removed from responses selected
+for replacement. Downstream GET and HEAD requests omit `If-None-Match` and
+`If-Modified-Since` so the original resource's validators cannot produce a stale
+304 before transformation. HEAD and streaming responses cannot compute a body
+hash and do not receive a replacement tag. Unmatched responses retain their
+headers but do not perform conditional revalidation. Other cache directives,
+such as `Cache-Control`, remain unchanged.
+
 **Module name:** `http.handlers.replace_response`
 
 

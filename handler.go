@@ -18,6 +18,7 @@ package replaceresponse
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
@@ -95,6 +96,17 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // ServeHTTP implements caddyhttp.MiddlewareHandler.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	ifNoneMatch := r.Header.Values("If-None-Match")
+	// The file's validators do not describe the transformed representation.
+	// Defer revalidation before downstream can return a bodyless 304. Clone
+	// only when needed so other handlers retain the original request headers.
+	if (r.Method == http.MethodGet || r.Method == http.MethodHead) &&
+		(r.Header.Get("If-None-Match") != "" || r.Header.Get("If-Modified-Since") != "") {
+		r = r.Clone(r.Context())
+		r.Header.Del("If-None-Match")
+		r.Header.Del("If-Modified-Since")
+	}
+
 	if h.Stream {
 		if c := h.logger.Check(zapcore.DebugLevel, "streaming body replacement"); c != nil {
 			c.Write(
@@ -169,6 +181,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if err != nil {
 		return err
 	}
+	w.Header().Del("Etag")
+	w.Header().Del("Last-Modified")
+
+	if r.Method == http.MethodGet && rec.Status() == http.StatusOK {
+		// Use the transformed representation, including request placeholder
+		// expansions. A weak tag remains valid across downstream compression.
+		etag := fmt.Sprintf(`W/"replace-response-%x"`, sha256.Sum256(result))
+		w.Header().Set("Etag", etag)
+		if matchesETag(ifNoneMatch, etag) {
+			w.Header().Del("Content-Type")
+			w.Header().Del("Content-Length")
+			w.Header().Del("Content-Encoding")
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+	}
 
 	// make sure length is correct, otherwise bad things can happen;
 	// responses without a body (HEAD, 1xx, 204, 304) can't tell us the
@@ -204,10 +232,10 @@ func (h *Handler) makeTransformer(req *http.Request) transform.Transformer {
 			tr.MaxMatchSize = 2048
 			transforms[i] = tr
 		} else {
-			transforms[i] = replace.String(
-				reqReplacer.ReplaceKnown(repl.Search, ""),
-				reqReplacer.ReplaceKnown(repl.Replace, ""),
-			)
+			transforms[i] = &literalTransformer{
+				search:  []byte(reqReplacer.ReplaceKnown(repl.Search, "")),
+				replace: []byte(reqReplacer.ReplaceKnown(repl.Replace, "")),
+			}
 		}
 	}
 	return transform.Chain(transforms...)
@@ -243,12 +271,20 @@ func (fw *replaceWriter) WriteHeader(status int) {
 	if fw.wroteHeader {
 		return
 	}
+	// Informational responses do not commit the final status or select
+	// whether its body should be transformed.
+	if status >= 100 && status <= 199 {
+		fw.ResponseWriterWrapper.WriteHeader(status)
+		return
+	}
 	fw.wroteHeader = true
 
 	if fw.handler.Matcher == nil || fw.handler.Matcher.Match(status, fw.ResponseWriterWrapper.Header()) {
 		// we don't know the length after replacements since
 		// we're not buffering it all to find out
 		fw.Header().Del("Content-Length")
+		fw.Header().Del("Etag")
+		fw.Header().Del("Last-Modified")
 		fw.tw = transform.NewWriter(fw.ResponseWriterWrapper, fw.tr)
 	}
 
@@ -265,6 +301,12 @@ func (fw *replaceWriter) Write(d []byte) (int, error) {
 	} else {
 		return fw.ResponseWriterWrapper.Write(d)
 	}
+}
+
+func (fw *replaceWriter) ReadFrom(r io.Reader) (int64, error) {
+	// Hide ReaderFrom so io.Copy goes through Write instead of the
+	// embedded wrapper's fast path, which bypasses replacement.
+	return io.Copy(struct{ io.Writer }{fw}, r)
 }
 
 func (fw *replaceWriter) Close() error {
