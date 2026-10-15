@@ -15,8 +15,8 @@ import (
 
 func TestBufferedContentLength(t *testing.T) {
 	const (
-		source   = `<script src="/config.js?v=__V__"></script>`
-		replaced = `<script src="/config.js?v=v1.0.162"></script>`
+		source   = "hello __NAME__"
+		replaced = "hello world"
 	)
 
 	for _, tc := range []struct {
@@ -49,7 +49,7 @@ func TestBufferedContentLength(t *testing.T) {
 			})
 
 			h := &Handler{
-				Replacements: []*Replacement{{Search: "__V__", Replace: "v1.0.162"}},
+				Replacements: []*Replacement{{Search: "__NAME__", Replace: "world"}},
 				logger:       zap.NewNop(),
 			}
 			req := httptest.NewRequest(tc.method, "/", nil)
