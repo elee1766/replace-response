@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,6 +18,60 @@ import (
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
+
+func TestStaticFileReplacements(t *testing.T) {
+	const source = `<!doctype html>
+<html><head><title>__TITLE__</title></head>
+<body><h1>__TITLE__</h1><img src="/old/logo.svg"><a href="/old/help.html">Help</a></body></html>`
+	const want = `<!doctype html>
+<html><head><title>Example site</title></head>
+<body><h1>Example site</h1><img src="/assets/logo.svg"><a href="/assets/help.html">Help</a></body></html>`
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "page.html"), []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	files := http.FileServer(http.Dir(dir))
+	next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+		files.ServeHTTP(w, r)
+		return nil
+	})
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			h := &Handler{
+				Stream: stream,
+				Replacements: []*Replacement{
+					{Search: "__TITLE__", Replace: "Example site"},
+					{SearchRegexp: `/old/([^"<>]+)`, Replace: "/assets/$1"},
+				},
+			}
+			if err := h.Provision(caddy.Context{Context: context.Background()}); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodGet, "/page.html", nil)
+			req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, caddy.NewReplacer()))
+			rec := httptest.NewRecorder()
+			if err := h.ServeHTTP(rec, req, next); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", rec.Code)
+			}
+			if got := rec.Body.String(); got != want {
+				t.Errorf("body = %q, want %q", got, want)
+			}
+			if got := rec.Result().Header.Get("Content-Type"); got != "text/html; charset=utf-8" {
+				t.Errorf("Content-Type = %q, want text/html; charset=utf-8", got)
+			}
+			wantLength := strconv.Itoa(len(want))
+			if stream {
+				wantLength = ""
+			}
+			if got := rec.Result().Header.Get("Content-Length"); got != wantLength {
+				t.Errorf("Content-Length = %q, want %q", got, wantLength)
+			}
+		})
+	}
+}
 
 func TestStreamingCopy(t *testing.T) {
 	for _, matched := range []bool{true, false} {
